@@ -4,6 +4,7 @@ import os
 import tempfile
 import librosa
 import numpy as np
+import scipy.ndimage
 
 app = FastAPI()
 
@@ -134,6 +135,114 @@ async def analyze_key(file: UploadFile = File(...)):
             "filename": file.filename,
             "detected_key": best_key,
             "camelot_code": camelot_code
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+    
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+@app.post("/analyze-structure")
+async def analyze_structure(file: UploadFile = File(...)):
+    suffix = os.path.splitext(file.filename)[1]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+        shutil.copyfileobj(file.file, temp_file)
+        temp_path = temp_file.name
+
+    try:
+        # Load audio (downsample to 22050 for speed)
+        y, sr = librosa.load(temp_path, sr=22050)
+
+        # 1. Calculate RMS Energy (Loudness) and Spectral Contrast (Bass vs Treble)
+        # Hop length of 512 gives us roughly 43 analysis frames per second
+        hop_length = 512
+        
+        # Calculate Root Mean Square energy (overall volume)
+        rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+        
+        # Calculate Spectral Centroid (brightness - helps detect drops)
+        cent = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length)[0]
+        
+        # Calculate Low-Frequency Energy (Bass)
+        S = np.abs(librosa.stft(y, hop_length=hop_length))
+        fft_freqs = librosa.fft_frequencies(sr=sr)
+        # Sum energy below 200Hz
+        bass_mask = fft_freqs < 200
+        bass_energy = np.sum(S[bass_mask, :], axis=0)
+
+        # Smooth the signals to remove jitter (like short drum hits)
+        # We use a median filter over ~1 second (43 frames)
+        smoothing_window = 43 
+        bass_smooth = scipy.ndimage.median_filter(bass_energy, size=smoothing_window)
+        rms_smooth = scipy.ndimage.median_filter(rms, size=smoothing_window)
+        
+        # Normalize signals to 0-1 range for easier thresholding
+        bass_norm = librosa.util.normalize(bass_smooth)
+        rms_norm = librosa.util.normalize(rms_smooth)
+
+        # 2. Detect "Drop" and "Breakdown" events
+        # Logic: 
+        # - High Bass + High RMS = Drop / Main Chorus
+        # - Low Bass + Medium/High RMS = Intro / Breakdown / Build-up
+        
+        # Convert frames to time
+        times = librosa.frames_to_time(np.arange(len(bass_norm)), sr=sr, hop_length=hop_length)
+        
+        # Create segments (simplified for response)
+        # We classify every 1 second chunk
+        duration = librosa.get_duration(y=y, sr=sr)
+        segments = []
+        
+        # Sample every 5 seconds to reduce output size
+        sample_rate_sec = 5
+        for t in range(0, int(duration), sample_rate_sec):
+            # Find frame index for this time
+            idx = librosa.time_to_frames(t, sr=sr, hop_length=hop_length)
+            if idx >= len(bass_norm): break
+            
+            b_val = bass_norm[idx]
+            r_val = rms_norm[idx]
+            
+            label = "Unknown"
+            if b_val > 0.6:
+                label = "High Energy (Drop/Chorus)"
+            elif b_val < 0.3 and r_val > 0.3:
+                label = "Breakdown/Build"
+            elif b_val < 0.2 and r_val < 0.2:
+                label = "Quiet/Intro/Outro"
+            else:
+                label = "Verse/Mid Energy"
+                
+            segments.append({
+                "time": t,
+                "label": label,
+                "bass_level": round(float(b_val), 2),
+                "energy_level": round(float(r_val), 2)
+            })
+
+        # 3. Find structural boundaries (Mix Points)
+        # Look for sudden large changes in bass energy
+        # Calculate derivative (rate of change)
+        bass_diff = np.diff(bass_norm)
+        # Find peaks in the derivative (sudden changes)
+        change_points_frames = np.where(np.abs(bass_diff) > 0.3)[0] # Threshold 0.3 implies 30% jump
+        change_points_times = librosa.frames_to_time(change_points_frames, sr=sr, hop_length=hop_length)
+        
+        # Filter changes that are too close together (keep only one every 10s)
+        filtered_changes = []
+        last_change = -100
+        for cp in change_points_times:
+            if cp - last_change > 10:
+                filtered_changes.append(round(float(cp), 2))
+                last_change = cp
+
+        return {
+            "filename": file.filename,
+            "duration_sec": round(duration, 2),
+            "mix_points_bass_change": filtered_changes,
+            "segments_5s_interval": segments
         }
 
     except Exception as e:
